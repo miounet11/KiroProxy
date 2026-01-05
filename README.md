@@ -18,6 +18,12 @@
 
 ---
 
+> **⚠️ 测试说明**
+> 
+> 本项目主要针对 **Claude Code (VSCode 插件版)** 进行测试，工具调用功能已验证可用。
+> 
+> 其他客户端（Codex CLI、Gemini CLI、Claude Code CLI 等）理论上兼容，但未经充分测试，如遇问题欢迎反馈。
+
 ## 功能特性
 
 - **多协议支持** - OpenAI / Anthropic / Gemini 三种协议兼容
