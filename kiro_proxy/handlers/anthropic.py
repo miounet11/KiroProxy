@@ -7,7 +7,7 @@ from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..config import KIRO_API_URL, map_model_name
-from ..core import state
+from ..core import state, RetryableRequest, is_retryable_error
 from ..core.state import RequestLog
 from ..credential import quota_manager
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream_full, is_quota_exceeded_error
@@ -146,7 +146,7 @@ async def handle_messages(request: Request):
 
 
 async def _handle_stream(kiro_request, headers, account, model, log_id, start_time, session_id=None):
-    """Handle streaming responses with auto-retry on quota exceeded."""
+    """Handle streaming responses with auto-retry on quota exceeded and network errors."""
     
     async def generate():
         current_account = account
@@ -168,17 +168,22 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                                 print(f"[Stream] 配额超限，切换账号: {current_account.id} -> {next_account.id}")
                                 current_account = next_account
                                 token = current_account.get_token()
-                                creds = current_account.get_credentials()
-                                headers.update({
-                                    "Authorization": f"Bearer {token}",
-                                    "x-amz-user-agent": headers["x-amz-user-agent"].replace(
-                                        account.get_machine_id(), current_account.get_machine_id()
-                                    )
-                                })
+                                headers["Authorization"] = f"Bearer {token}"
                                 retry_count += 1
                                 continue
                             
                             yield f'data: {{"type":"error","error":{{"type":"rate_limit_error","message":"All accounts rate limited"}}}}\n\n'
+                            return
+
+                        # 处理可重试的服务端错误
+                        if is_retryable_error(response.status_code):
+                            if retry_count < max_retries:
+                                print(f"[Stream] 服务端错误 {response.status_code}，重试 {retry_count + 1}/{max_retries}")
+                                retry_count += 1
+                                import asyncio
+                                await asyncio.sleep(0.5 * (2 ** retry_count))
+                                continue
+                            yield f'data: {{"type":"error","error":{{"type":"api_error","message":"Server error after retries"}}}}\n\n'
                             return
 
                         if response.status_code != 200:
@@ -195,6 +200,7 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                                 next_account = state.get_next_available_account(current_account.id)
                                 if next_account and retry_count < max_retries:
                                     current_account = next_account
+                                    headers["Authorization"] = f"Bearer {current_account.get_token()}"
                                     retry_count += 1
                                     continue
 
@@ -258,7 +264,32 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                         current_account.last_used = time.time()
                         return
 
+            except httpx.TimeoutException:
+                if retry_count < max_retries:
+                    print(f"[Stream] 请求超时，重试 {retry_count + 1}/{max_retries}")
+                    retry_count += 1
+                    import asyncio
+                    await asyncio.sleep(0.5 * (2 ** retry_count))
+                    continue
+                yield f'data: {{"type":"error","error":{{"type":"api_error","message":"Request timeout after retries"}}}}\n\n'
+                return
+            except httpx.ConnectError:
+                if retry_count < max_retries:
+                    print(f"[Stream] 连接错误，重试 {retry_count + 1}/{max_retries}")
+                    retry_count += 1
+                    import asyncio
+                    await asyncio.sleep(0.5 * (2 ** retry_count))
+                    continue
+                yield f'data: {{"type":"error","error":{{"type":"api_error","message":"Connection error after retries"}}}}\n\n'
+                return
             except Exception as e:
+                # 检查是否为可重试的网络错误
+                if is_retryable_error(None, e) and retry_count < max_retries:
+                    print(f"[Stream] 网络错误，重试 {retry_count + 1}/{max_retries}: {type(e).__name__}")
+                    retry_count += 1
+                    import asyncio
+                    await asyncio.sleep(0.5 * (2 ** retry_count))
+                    continue
                 yield f'data: {{"type":"error","error":{{"type":"api_error","message":"{str(e)}"}}}}\n\n'
                 return
 
@@ -266,11 +297,12 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
 
 
 async def _handle_non_stream(kiro_request, headers, account, model, log_id, start_time, session_id=None):
-    """Handle non-streaming responses with auto-retry on quota exceeded."""
+    """Handle non-streaming responses with auto-retry on quota exceeded and network errors."""
     error_msg = None
     status_code = 200
     current_account = account
     max_retries = 2
+    retry_ctx = RetryableRequest(max_retries=2)
 
     for retry in range(max_retries + 1):
         try:
@@ -293,6 +325,14 @@ async def _handle_non_stream(kiro_request, headers, account, model, log_id, star
                         continue
                     
                     raise HTTPException(429, "All accounts rate limited")
+
+                # 处理可重试的服务端错误
+                if is_retryable_error(response.status_code):
+                    if retry < max_retries:
+                        print(f"[NonStream] 服务端错误 {response.status_code}，重试 {retry + 1}/{max_retries}")
+                        await retry_ctx.wait()
+                        continue
+                    raise HTTPException(response.status_code, f"Server error after {max_retries} retries")
 
                 if response.status_code != 200:
                     error_msg = response.text
@@ -317,9 +357,30 @@ async def _handle_non_stream(kiro_request, headers, account, model, log_id, star
 
         except HTTPException:
             raise
+        except httpx.TimeoutException as e:
+            error_msg = f"Request timeout: {e}"
+            status_code = 408
+            if retry < max_retries:
+                print(f"[NonStream] 请求超时，重试 {retry + 1}/{max_retries}")
+                await retry_ctx.wait()
+                continue
+            raise HTTPException(408, "Request timeout after retries")
+        except httpx.ConnectError as e:
+            error_msg = f"Connection error: {e}"
+            status_code = 502
+            if retry < max_retries:
+                print(f"[NonStream] 连接错误，重试 {retry + 1}/{max_retries}")
+                await retry_ctx.wait()
+                continue
+            raise HTTPException(502, "Connection error after retries")
         except Exception as e:
             error_msg = str(e)
             status_code = 500
+            # 检查是否为可重试的网络错误
+            if is_retryable_error(None, e) and retry < max_retries:
+                print(f"[NonStream] 网络错误，重试 {retry + 1}/{max_retries}: {type(e).__name__}")
+                await retry_ctx.wait()
+                continue
             raise HTTPException(500, str(e))
         finally:
             if retry == max_retries or status_code == 200:

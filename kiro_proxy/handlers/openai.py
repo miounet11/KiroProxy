@@ -9,7 +9,7 @@ from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..config import KIRO_API_URL, map_model_name
-from ..core import state
+from ..core import state, is_retryable_error
 from ..core.state import RequestLog
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, is_quota_exceeded_error
 from ..converters import generate_session_id, convert_openai_messages_to_kiro, extract_images_from_content
@@ -98,6 +98,14 @@ async def handle_chat_completions(request: Request):
                     
                     raise HTTPException(429, "All accounts rate limited")
                 
+                # 处理可重试的服务端错误
+                if is_retryable_error(resp.status_code):
+                    if retry < max_retries:
+                        print(f"[OpenAI] 服务端错误 {resp.status_code}，重试 {retry + 1}/{max_retries}")
+                        await asyncio.sleep(0.5 * (2 ** retry))
+                        continue
+                    raise HTTPException(resp.status_code, f"Server error after {max_retries} retries")
+                
                 if resp.status_code != 200:
                     error_msg = resp.text
                     print(f"[OpenAI] Kiro API error {resp.status_code}: {resp.text[:500]}")
@@ -120,9 +128,30 @@ async def handle_chat_completions(request: Request):
                 
         except HTTPException:
             raise
+        except httpx.TimeoutException:
+            error_msg = "Request timeout"
+            status_code = 408
+            if retry < max_retries:
+                print(f"[OpenAI] 请求超时，重试 {retry + 1}/{max_retries}")
+                await asyncio.sleep(0.5 * (2 ** retry))
+                continue
+            raise HTTPException(408, "Request timeout after retries")
+        except httpx.ConnectError:
+            error_msg = "Connection error"
+            status_code = 502
+            if retry < max_retries:
+                print(f"[OpenAI] 连接错误，重试 {retry + 1}/{max_retries}")
+                await asyncio.sleep(0.5 * (2 ** retry))
+                continue
+            raise HTTPException(502, "Connection error after retries")
         except Exception as e:
             error_msg = str(e)
             status_code = 500
+            # 检查是否为可重试的网络错误
+            if is_retryable_error(None, e) and retry < max_retries:
+                print(f"[OpenAI] 网络错误，重试 {retry + 1}/{max_retries}: {type(e).__name__}")
+                await asyncio.sleep(0.5 * (2 ** retry))
+                continue
             raise HTTPException(500, str(e))
     
     # 记录日志
