@@ -341,12 +341,41 @@ class HistoryManager:
         recent_history: List[dict],
         debug_label: Optional[str] = None
     ) -> List[dict]:
-        """用摘要替换旧历史，保留最近完整上下文"""
+        """用摘要替换旧历史，保留最近完整上下文
+        
+        关键规则：
+        1. 历史必须以 user 消息开头
+        2. user/assistant 必须严格交替
+        3. 当 assistant 有 toolUses 时，下一条 user 必须有对应的 toolResults
+        4. 当 assistant 没有 toolUses 时，下一条 user 不能有 toolResults
+        """
         if any("userInputMessage" in h or "assistantResponseMessage" in h for h in recent_history):
+            # 如果 recent_history 以 assistant 开头，跳过它
             if recent_history and "assistantResponseMessage" in recent_history[0]:
                 recent_history = recent_history[1:]
 
+            # 收集所有 toolUse IDs（用于后续验证）
+            tool_use_ids = set()
+            for msg in recent_history:
+                if "assistantResponseMessage" in msg:
+                    for tu in msg["assistantResponseMessage"].get("toolUses", []) or []:
+                        tu_id = tu.get("toolUseId")
+                        if tu_id:
+                            tool_use_ids.add(tu_id)
+
+            # 检查 recent_history 的第一条消息
+            first_user_has_tool_results = False
+            if recent_history and "userInputMessage" in recent_history[0]:
+                ctx = recent_history[0].get("userInputMessage", {}).get("userInputMessageContext", {})
+                first_user_has_tool_results = bool(ctx.get("toolResults"))
+            
+            # 如果第一条 user 消息有 toolResults，需要清除它
+            # 因为摘要后的 assistant 占位消息没有 toolUses
+            if first_user_has_tool_results:
+                recent_history[0]["userInputMessage"].pop("userInputMessageContext", None)
+
             # 过滤孤立的 toolResults（没有对应 toolUse）
+            # 重新收集 tool_use_ids（因为可能已经修改了 recent_history）
             tool_use_ids = set()
             for msg in recent_history:
                 if "assistantResponseMessage" in msg:
@@ -369,6 +398,7 @@ class HistoryManager:
                             if not ctx:
                                 msg["userInputMessage"].pop("userInputMessageContext", None)
             else:
+                # 没有任何 toolUses，清除所有 toolResults
                 for msg in recent_history:
                     if "userInputMessage" in msg:
                         msg["userInputMessage"].pop("userInputMessageContext", None)
@@ -390,10 +420,10 @@ class HistoryManager:
                 }
             }
             result = [summary_msg]
+            # 占位 assistant 消息（没有 toolUses）
             result.append({
                 "assistantResponseMessage": {
-                    "content": "I understand the context. Let's continue.",
-                    "toolUses": [],
+                    "content": "I understand the context. Let's continue."
                 }
             })
             result.extend(recent_history)

@@ -89,6 +89,10 @@ async def handle_generate_content(model_name: str, request: Request):
     else:
         history = history_manager.pre_process(history, user_content)
     
+    # 摘要/截断后再次修复历史交替和 toolUses/toolResults 配对
+    from ..converters import fix_history_alternation
+    history = fix_history_alternation(history)
+    
     if history_manager.was_truncated:
         print(f"[Gemini] {history_manager.truncate_info}")
 

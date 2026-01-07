@@ -16,7 +16,7 @@ from ..core.state import RequestLog
 from ..core.history_manager import HistoryManager, get_history_config
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
-from ..kiro_api import build_headers, build_kiro_request, parse_event_stream_full, is_quota_exceeded_error
+from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, parse_event_stream_full, is_quota_exceeded_error
 
 
 def _convert_responses_input_to_kiro(input_data, instructions: str = None):
@@ -132,8 +132,7 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
                 # 添加 assistant 消息
                 assistant_msg = {
                     "assistantResponseMessage": {
-                        "content": text or "I understand.",
-                        "toolUses": []
+                        "content": text or "I understand."
                     }
                 }
                 if pending_tool_uses:
@@ -141,6 +140,7 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
                     pending_tool_uses = []
                     last_was_assistant_with_tools = True
                 else:
+                    # 没有 toolUses 时不添加这个字段
                     last_was_assistant_with_tools = False
                 
                 history.append(assistant_msg)
@@ -170,6 +170,11 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
             call_id = item.get("call_id", "")
             output = item.get("output", {})
             
+            # 跳过没有 call_id 的 tool output
+            if not call_id:
+                print(f"[Responses] Warning: function_call_output without call_id, skipping")
+                continue
+            
             if isinstance(output, str):
                 output_str = output
                 status = "success"
@@ -197,6 +202,28 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
     if pending_tool_outputs:
         tool_results = pending_tool_outputs
     
+    # 验证并修复 history 中的 toolUses/toolResults 配对
+    # Kiro API 规则：当 assistant 有 toolUses 时，下一条 user 必须有对应的 toolResults
+    for i in range(len(history) - 1):
+        if "assistantResponseMessage" in history[i]:
+            assistant = history[i]["assistantResponseMessage"]
+            has_tool_uses = bool(assistant.get("toolUses"))
+            
+            if i + 1 < len(history) and "userInputMessage" in history[i + 1]:
+                user = history[i + 1]["userInputMessage"]
+                ctx = user.get("userInputMessageContext", {})
+                has_tool_results = bool(ctx.get("toolResults"))
+                
+                # 确保配对一致
+                if has_tool_uses and not has_tool_results:
+                    # assistant 有 toolUses 但 user 没有 toolResults，清除 toolUses
+                    print(f"[Responses] Warning: history[{i}] has toolUses but history[{i+1}] has no toolResults, removing toolUses")
+                    assistant.pop("toolUses", None)
+                elif not has_tool_uses and has_tool_results:
+                    # assistant 没有 toolUses 但 user 有 toolResults，清除 toolResults
+                    print(f"[Responses] Warning: history[{i}] has no toolUses but history[{i+1}] has toolResults, removing toolResults")
+                    user.pop("userInputMessageContext", None)
+    
     # 调试日志
     print(f"[Responses] Converted: history={len(history)}, tool_results={len(tool_results)}")
     for i, h in enumerate(history):
@@ -204,8 +231,10 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
             has_tr = "toolResults" in h.get("userInputMessage", {}).get("userInputMessageContext", {})
             print(f"[Responses]   history[{i}]: userInputMessage, has_toolResults={has_tr}")
         elif "assistantResponseMessage" in h:
-            has_tu = bool(h.get("assistantResponseMessage", {}).get("toolUses"))
-            print(f"[Responses]   history[{i}]: assistantResponseMessage, has_toolUses={has_tu}")
+            arm = h.get("assistantResponseMessage", {})
+            has_tu_field = "toolUses" in arm
+            tu_count = len(arm.get("toolUses", []) or []) if has_tu_field else 0
+            print(f"[Responses]   history[{i}]: assistantResponseMessage, has_toolUses_field={has_tu_field}, toolUses_count={tu_count}")
     
     images = pending_images if pending_images else None
     return user_content, history, tool_results, images
@@ -248,7 +277,10 @@ def _convert_tools_to_kiro(tools: list) -> list:
     if not tools:
         return None
     
+    MAX_TOOLS = 50  # Kiro API 工具数量限制
     kiro_tools = []
+    function_count = 0
+    
     for tool in tools:
         tool_type = tool.get("type", "")
         
@@ -263,6 +295,10 @@ def _convert_tools_to_kiro(tools: list) -> list:
             continue
         elif tool_type == "local_shell":
             # local_shell 是 OpenAI 原生工具，Kiro 不支持，跳过
+            continue
+        
+        # 限制工具数量
+        if function_count >= MAX_TOOLS:
             continue
         
         # Responses API 格式：字段直接在工具对象上
@@ -296,6 +332,8 @@ def _convert_tools_to_kiro(tools: list) -> list:
         
         if not name:
             continue
+        
+        function_count += 1
         
         # 转换为 Kiro 格式
         kiro_tools.append({
@@ -385,6 +423,9 @@ async def handle_responses(request: Request):
     else:
         history = history_manager.pre_process(history, user_content)
     
+    # 摘要/截断后再次修复历史交替和 toolUses/toolResults 配对
+    history = fix_history_alternation(history)
+    
     if history_manager.was_truncated:
         print(f"[Responses] {history_manager.truncate_info}")
     
@@ -398,6 +439,53 @@ async def handle_responses(request: Request):
             print(f"[Responses] input[{i}]: type={item_type}, role={role}")
         print(f"[Responses] history len: {len(history)}, tool_results len: {len(tool_results)}, images: {len(images) if images else 0}")
         print(f"[Responses] user_content len: {len(user_content)}")
+    
+    # 验证 tool_results 与 history 的一致性
+    if tool_results and history:
+        # 找到最后一个 assistant 消息
+        last_assistant = None
+        last_assistant_idx = -1
+        for i, msg in enumerate(reversed(history)):
+            if "assistantResponseMessage" in msg:
+                last_assistant = msg["assistantResponseMessage"]
+                last_assistant_idx = len(history) - 1 - i
+                break
+        
+        if last_assistant:
+            tool_use_ids = set()
+            for tu in last_assistant.get("toolUses", []) or []:
+                tu_id = tu.get("toolUseId")
+                if tu_id:
+                    tool_use_ids.add(tu_id)
+            
+            print(f"[Responses] Last assistant at idx={last_assistant_idx}, toolUse_ids={tool_use_ids}")
+            print(f"[Responses] tool_results ids={[tr.get('toolUseId') for tr in tool_results]}")
+            
+            # 过滤 tool_results，只保留有对应 toolUse 的
+            if tool_use_ids:
+                filtered_results = [tr for tr in tool_results if tr.get("toolUseId") in tool_use_ids]
+                if len(filtered_results) != len(tool_results):
+                    print(f"[Responses] Filtered tool_results: {len(tool_results)} -> {len(filtered_results)}")
+                    tool_results = filtered_results
+            else:
+                # 如果最后一个 assistant 没有 toolUses，清空 tool_results
+                print(f"[Responses] Warning: Last assistant has no toolUses, clearing tool_results")
+                tool_results = []
+        else:
+            print(f"[Responses] Warning: No assistant message in history, clearing tool_results")
+            tool_results = []
+    
+    # 确保所有消息都有非空的 content
+    for i, msg in enumerate(history):
+        if "userInputMessage" in msg:
+            uim = msg["userInputMessage"]
+            if not uim.get("content"):
+                uim["content"] = "Continue"
+        elif "assistantResponseMessage" in msg:
+            arm = msg["assistantResponseMessage"]
+            if not arm.get("content"):
+                arm["content"] = "I understand."
+    
     kiro_request = build_kiro_request(
         user_content, model, history,
         tools=kiro_tools,
@@ -407,7 +495,20 @@ async def handle_responses(request: Request):
     
     # 调试：打印完整的 Kiro 请求
     if tool_results:
-        print(f"[Responses] Kiro request with tool_results: {json.dumps(kiro_request, indent=2)[:3000]}")
+        # 打印请求结构（不包括 tools，因为太长）
+        debug_request = {
+            "conversationState": {
+                "history_len": len(kiro_request.get("conversationState", {}).get("history", [])),
+                "currentMessage": kiro_request.get("conversationState", {}).get("currentMessage", {}),
+            }
+        }
+        # 移除 tools 以便打印
+        if "userInputMessageContext" in debug_request["conversationState"]["currentMessage"].get("userInputMessage", {}):
+            ctx = debug_request["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+            if "tools" in ctx:
+                ctx["tools_count"] = len(ctx["tools"])
+                del ctx["tools"]
+        print(f"[Responses] Kiro request structure: {json.dumps(debug_request, indent=2)}")
     
     if stream:
         return await _handle_stream(kiro_request, headers, account, model, log_id, start_time)
@@ -462,6 +563,15 @@ def _build_response(result: dict, model: str, response_id: str) -> dict:
 async def _handle_stream(kiro_request, headers, account, model, log_id, start_time):
     """流式处理 - Codex 期望的 SSE 格式"""
     
+    # 保存完整请求用于调试
+    import os
+    debug_dir = "debug_requests"
+    os.makedirs(debug_dir, exist_ok=True)
+    debug_file = f"{debug_dir}/{log_id}_request.json"
+    with open(debug_file, 'w', encoding='utf-8') as f:
+        json.dump(kiro_request, f, indent=2, ensure_ascii=False)
+    print(f"[Responses] Saved request to {debug_file}")
+    
     async def generate():
         response_id = f"resp_{log_id}"
         item_id = f"msg_{log_id}"
@@ -487,11 +597,39 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                             hist = cs.get("history", [])
                             print(f"[Responses] 400 Debug: history_len={len(hist)}")
                             if hist:
-                                # 检查 history 结构
-                                for i, h in enumerate(hist[:3]):
-                                    print(f"[Responses]   hist[{i}]: {list(h.keys())}")
-                                if len(hist) > 3:
-                                    print(f"[Responses]   ... ({len(hist)-3} more)")
+                                # 检查每条 history 的详细结构
+                                for i, h in enumerate(hist[:5]):  # 只打印前5条
+                                    if "userInputMessage" in h:
+                                        uim = h["userInputMessage"]
+                                        has_ctx = "userInputMessageContext" in uim
+                                        has_tr = has_ctx and "toolResults" in uim.get("userInputMessageContext", {})
+                                        content_len = len(uim.get("content", ""))
+                                        uim_keys = list(uim.keys())
+                                        print(f"[Responses]   hist[{i}]: user, keys={uim_keys}, content_len={content_len}, has_toolResults={has_tr}")
+                                    elif "assistantResponseMessage" in h:
+                                        arm = h["assistantResponseMessage"]
+                                        arm_keys = list(arm.keys())
+                                        has_tu = "toolUses" in arm
+                                        tu_count = len(arm.get("toolUses", []) or []) if has_tu else 0
+                                        content_len = len(arm.get("content", "") or "")
+                                        print(f"[Responses]   hist[{i}]: assistant, keys={arm_keys}, content_len={content_len}, has_toolUses={has_tu}, toolUses_count={tu_count}")
+                                    else:
+                                        print(f"[Responses]   hist[{i}]: UNKNOWN keys={list(h.keys())}")
+                                if len(hist) > 5:
+                                    print(f"[Responses]   ... ({len(hist) - 5} more)")
+                            
+                            # 打印 currentMessage 结构
+                            cm = cs.get("currentMessage", {})
+                            if "userInputMessage" in cm:
+                                uim = cm["userInputMessage"]
+                                print(f"[Responses] currentMessage: keys={list(uim.keys())}, content_len={len(uim.get('content', ''))}")
+                                if "userInputMessageContext" in uim:
+                                    ctx = uim["userInputMessageContext"]
+                                    print(f"[Responses]   context keys={list(ctx.keys())}")
+                                    if "toolResults" in ctx:
+                                        print(f"[Responses]   toolResults count={len(ctx['toolResults'])}")
+                                    if "tools" in ctx:
+                                        print(f"[Responses]   tools count={len(ctx['tools'])}")
                         
                         error_occurred = True
                         

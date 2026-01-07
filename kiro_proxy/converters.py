@@ -143,16 +143,23 @@ def convert_anthropic_tools_to_kiro(tools: List[dict]) -> List[dict]:
 
 
 def fix_history_alternation(history: List[dict], model_id: str = "claude-sonnet-4") -> List[dict]:
-    """修复历史记录，确保 user/assistant 严格交替
+    """修复历史记录，确保 user/assistant 严格交替，并验证 toolUses/toolResults 配对
     
-    Kiro API 要求消息必须严格交替：user -> assistant -> user -> assistant
+    Kiro API 规则：
+    1. 消息必须严格交替：user -> assistant -> user -> assistant
+    2. 当 assistant 有 toolUses 时，下一条 user 必须有对应的 toolResults
+    3. 当 assistant 没有 toolUses 时，下一条 user 不能有 toolResults
     """
     if not history:
         return history
     
+    # 深拷贝以避免修改原始数据
+    import copy
+    history = copy.deepcopy(history)
+    
     fixed = []
     
-    for item in history:
+    for i, item in enumerate(history):
         is_user = "userInputMessage" in item
         is_assistant = "assistantResponseMessage" in item
         
@@ -160,41 +167,56 @@ def fix_history_alternation(history: List[dict], model_id: str = "claude-sonnet-
             # 检查上一条是否也是 user
             if fixed and "userInputMessage" in fixed[-1]:
                 # 检查当前消息是否有 tool_results
-                has_tool_results = (
-                    item.get("userInputMessage", {})
-                    .get("userInputMessageContext", {})
-                    .get("toolResults")
-                )
+                user_msg = item["userInputMessage"]
+                ctx = user_msg.get("userInputMessageContext", {})
+                has_tool_results = bool(ctx.get("toolResults"))
                 
                 if has_tool_results:
                     # 合并 tool_results 到上一条 user 消息
-                    new_results = has_tool_results
+                    new_results = ctx["toolResults"]
                     last_user = fixed[-1]["userInputMessage"]
                     
                     if "userInputMessageContext" not in last_user:
                         last_user["userInputMessageContext"] = {}
                     
-                    ctx = last_user["userInputMessageContext"]
-                    if "toolResults" in ctx and ctx["toolResults"]:
-                        ctx["toolResults"].extend(new_results)
+                    last_ctx = last_user["userInputMessageContext"]
+                    if "toolResults" in last_ctx and last_ctx["toolResults"]:
+                        last_ctx["toolResults"].extend(new_results)
                     else:
-                        ctx["toolResults"] = new_results
+                        last_ctx["toolResults"] = new_results
                     continue
                 else:
-                    # 插入一个占位 assistant 消息
+                    # 插入一个占位 assistant 消息（不带 toolUses）
                     fixed.append({
                         "assistantResponseMessage": {
-                            "content": "I understand.",
-                            "toolUses": []
+                            "content": "I understand."
                         }
                     })
+            
+            # 验证 toolResults 与前一个 assistant 的 toolUses 配对
+            if fixed and "assistantResponseMessage" in fixed[-1]:
+                last_assistant = fixed[-1]["assistantResponseMessage"]
+                has_tool_uses = bool(last_assistant.get("toolUses"))
+                
+                user_msg = item["userInputMessage"]
+                ctx = user_msg.get("userInputMessageContext", {})
+                has_tool_results = bool(ctx.get("toolResults"))
+                
+                if has_tool_uses and not has_tool_results:
+                    # assistant 有 toolUses 但 user 没有 toolResults
+                    # 这是不允许的，需要清除 assistant 的 toolUses
+                    last_assistant.pop("toolUses", None)
+                elif not has_tool_uses and has_tool_results:
+                    # assistant 没有 toolUses 但 user 有 toolResults
+                    # 这是不允许的，需要清除 user 的 toolResults
+                    item["userInputMessage"].pop("userInputMessageContext", None)
             
             fixed.append(item)
         
         elif is_assistant:
             # 检查上一条是否也是 assistant
             if fixed and "assistantResponseMessage" in fixed[-1]:
-                # 插入一个占位 user 消息
+                # 插入一个占位 user 消息（不带 toolResults）
                 fixed.append({
                     "userInputMessage": {
                         "content": "Continue",
@@ -217,10 +239,11 @@ def fix_history_alternation(history: List[dict], model_id: str = "claude-sonnet-
     
     # 确保以 assistant 结尾（如果最后是 user，添加占位 assistant）
     if fixed and "userInputMessage" in fixed[-1]:
+        # 不需要清除 toolResults，因为它是与前一个 assistant 的 toolUses 配对的
+        # 占位 assistant 只是为了满足交替规则
         fixed.append({
             "assistantResponseMessage": {
-                "content": "I understand.",
-                "toolUses": []
+                "content": "I understand."
             }
         })
     
@@ -353,12 +376,16 @@ def convert_anthropic_messages_to_kiro(messages: List[dict], system="") -> Tuple
             if not assistant_text:
                 assistant_text = "I understand."
             
-            history.append({
+            assistant_msg = {
                 "assistantResponseMessage": {
-                    "content": assistant_text,
-                    "toolUses": tool_uses
+                    "content": assistant_text
                 }
-            })
+            }
+            # 只有在有 toolUses 时才添加这个字段
+            if tool_uses:
+                assistant_msg["assistantResponseMessage"]["toolUses"] = tool_uses
+            
+            history.append(assistant_msg)
     
     # 修复历史交替
     history = fix_history_alternation(history)
@@ -577,12 +604,16 @@ def convert_openai_messages_to_kiro(
             
             assistant_text = content if content else "I understand."
             
-            history.append({
+            assistant_msg = {
                 "assistantResponseMessage": {
-                    "content": assistant_text,
-                    "toolUses": tool_uses
+                    "content": assistant_text
                 }
-            })
+            }
+            # 只有在有 toolUses 时才添加这个字段
+            if tool_uses:
+                assistant_msg["assistantResponseMessage"]["toolUses"] = tool_uses
+            
+            history.append(assistant_msg)
     
     # 处理末尾的 tool results
     if pending_tool_results:
@@ -851,12 +882,16 @@ def convert_gemini_contents_to_kiro(
             
             assistant_text = text if text else "I understand."
             
-            history.append({
+            assistant_msg = {
                 "assistantResponseMessage": {
-                    "content": assistant_text,
-                    "toolUses": tool_calls
+                    "content": assistant_text
                 }
-            })
+            }
+            # 只有在有 toolUses 时才添加这个字段
+            if tool_calls:
+                assistant_msg["assistantResponseMessage"]["toolUses"] = tool_calls
+            
+            history.append(assistant_msg)
     
     # 处理末尾的 tool results
     if pending_tool_results:
