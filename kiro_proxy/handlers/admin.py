@@ -10,6 +10,7 @@ from fastapi import Request, HTTPException, Query
 
 from ..config import TOKEN_PATH, MODELS_URL
 from ..core import state, Account, stats_manager, get_browsers_info, open_url, flow_monitor, get_account_usage
+from ..core import get_proxy_manager, get_rule_manager, get_rate_limiter
 from ..credential import quota_manager, generate_machine_id, get_kiro_version, CredentialStatus
 from ..auth import start_device_flow, poll_device_flow, cancel_device_flow, get_login_state, save_credentials_to_file
 from ..auth import start_social_auth, exchange_social_auth_token, cancel_social_auth, get_social_auth_state
@@ -1100,3 +1101,81 @@ def get_remote_login_page(session_id: str) -> str:
     </body>
     </html>
     """
+
+
+# ==================== 代理管理 API ====================
+
+async def get_proxy_config():
+    """获取代理配置"""
+    pm = get_proxy_manager()
+    return {
+        "enabled": pm.config.enabled,
+        "proxy_url": pm.config.proxy_url,
+        "has_session_placeholder": "%s" in pm.config.proxy_url if pm.config.proxy_url else False,
+        "cached_sessions": len(pm._session_cache),
+    }
+
+
+async def update_proxy_config(request: Request):
+    """更新代理配置"""
+    body = await request.json()
+    pm = get_proxy_manager()
+    pm.update_config(**body)
+    return {"ok": True, **pm.get_stats()}
+
+
+# ==================== 自定义规则 API ====================
+
+async def get_custom_rules():
+    """获取自定义规则"""
+    rm = get_rule_manager()
+    return {
+        "rules_text": rm.get_rules_text(),
+        **rm.get_stats()
+    }
+
+
+async def update_custom_rules(request: Request):
+    """更新自定义规则"""
+    body = await request.json()
+    rules_text = body.get("rules_text", "")
+    rm = get_rule_manager()
+    rm.set_rules_from_text(rules_text)
+    return {"ok": True, **rm.get_stats()}
+
+
+# ==================== 账号优先级 API ====================
+
+async def update_account_priority(account_id: str, request: Request):
+    """更新账号优先级"""
+    body = await request.json()
+    priority = body.get("priority", 0)
+    for acc in state.accounts:
+        if acc.id == account_id:
+            acc.priority = priority
+            state._save_accounts()
+            return {"ok": True, "priority": priority}
+    raise HTTPException(404, "Account not found")
+
+
+# ==================== 限速配置 API ====================
+
+async def get_rate_limit_config():
+    """获取限速配置"""
+    rl = get_rate_limiter()
+    return {
+        "enabled": rl.config.enabled,
+        "min_request_interval": rl.config.min_request_interval,
+        "max_requests_per_minute": rl.config.max_requests_per_minute,
+        "global_max_requests_per_minute": rl.config.global_max_requests_per_minute,
+        "quota_cooldown_seconds": rl.config.quota_cooldown_seconds,
+        "polling_count": rl.config.polling_count,
+    }
+
+
+async def update_rate_limit_config(request: Request):
+    """更新限速配置"""
+    body = await request.json()
+    rl = get_rate_limiter()
+    rl.update_config(**body)
+    return {"ok": True, **rl.get_stats()}

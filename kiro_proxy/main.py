@@ -473,7 +473,44 @@ async def api_update_rate_limit_config(request: Request):
         "max_requests_per_minute": limiter.config.max_requests_per_minute,
         "global_max_requests_per_minute": limiter.config.global_max_requests_per_minute,
         "quota_cooldown_seconds": limiter.config.quota_cooldown_seconds,
+        "polling_count": limiter.config.polling_count,
     }}
+
+
+# ==================== 代理配置 API ====================
+
+@app.get("/api/settings/proxy")
+async def api_get_proxy_config():
+    """获取代理配置"""
+    return await admin.get_proxy_config()
+
+
+@app.post("/api/settings/proxy")
+async def api_update_proxy_config(request: Request):
+    """更新代理配置"""
+    return await admin.update_proxy_config(request)
+
+
+# ==================== 自定义规则 API ====================
+
+@app.get("/api/settings/rules")
+async def api_get_custom_rules():
+    """获取自定义规则"""
+    return await admin.get_custom_rules()
+
+
+@app.post("/api/settings/rules")
+async def api_update_custom_rules(request: Request):
+    """更新自定义规则"""
+    return await admin.update_custom_rules(request)
+
+
+# ==================== 账号优先级 API ====================
+
+@app.post("/api/accounts/{account_id}/priority")
+async def api_update_account_priority(account_id: str, request: Request):
+    """更新账号优先级"""
+    return await admin.update_account_priority(account_id, request)
 
 
 # ==================== 文档 API ====================

@@ -17,18 +17,21 @@ class RateLimitConfig:
     """限速配置"""
     # 每账号最小请求间隔（秒）
     min_request_interval: float = 0.5
-    
+
     # 每账号每分钟最大请求数
     max_requests_per_minute: int = 60
-    
+
     # 全局每分钟最大请求数
     global_max_requests_per_minute: int = 120
-    
+
     # 是否启用限速（同时控制配额冷却）
     enabled: bool = False
-    
+
     # 配额超限冷却时间（秒）- 只在 enabled=True 时生效
     quota_cooldown_seconds: int = 30
+
+    # 每次轮询使用的账号数量（0 表示不限制）
+    polling_count: int = 0
 
 
 @dataclass
@@ -111,6 +114,7 @@ class RateLimiter:
             "enabled": self.config.enabled,
             "global_rpm": sum(1 for t in self._global_requests if t > now - 60),
             "quota_cooldown_seconds": self.config.quota_cooldown_seconds,
+            "polling_count": self.config.polling_count,
             "accounts": {
                 aid: {
                     "rpm": state.get_requests_in_window(60),

@@ -18,9 +18,11 @@ from .error_handler import (
     get_anthropic_error_response, format_error_log
 )
 from .rate_limiter import RateLimiter, RateLimitConfig, rate_limiter, get_rate_limiter
+from .proxy_manager import ProxyManager, ProxyConfig, proxy_manager, get_proxy_manager
+from .custom_rules import CustomRuleManager, CustomRule, RuleAction, RuleMatchResult, rule_manager, get_rule_manager
 
 __all__ = [
-    "state", "ProxyState", "RequestLog", "Account", 
+    "state", "ProxyState", "RequestLog", "Account",
     "load_config", "save_config", "CONFIG_FILE",
     "RetryableRequest", "is_retryable_error", "RETRYABLE_STATUS_CODES",
     "scheduler", "stats_manager",
@@ -32,5 +34,7 @@ __all__ = [
     "is_content_length_error",
     "ErrorType", "KiroError", "classify_error", "is_account_suspended",
     "get_anthropic_error_response", "format_error_log",
-    "RateLimiter", "RateLimitConfig", "rate_limiter", "get_rate_limiter"
+    "RateLimiter", "RateLimitConfig", "rate_limiter", "get_rate_limiter",
+    "ProxyManager", "ProxyConfig", "proxy_manager", "get_proxy_manager",
+    "CustomRuleManager", "CustomRule", "RuleAction", "RuleMatchResult", "rule_manager", "get_rule_manager"
 ]

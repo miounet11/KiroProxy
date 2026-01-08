@@ -51,7 +51,8 @@ class ProxyState:
                         id=acc_data["id"],
                         name=acc_data["name"],
                         token_path=acc_data["token_path"],
-                        enabled=acc_data.get("enabled", True)
+                        enabled=acc_data.get("enabled", True),
+                        priority=acc_data.get("priority", 0)
                     ))
             print(f"[State] 从配置加载 {len(self.accounts)} 个账号")
         
@@ -71,7 +72,8 @@ class ProxyState:
                 "id": acc.id,
                 "name": acc.name,
                 "token_path": acc.token_path,
-                "enabled": acc.enabled
+                "enabled": acc.enabled,
+                "priority": acc.priority
             }
             for acc in self.accounts
         ]
@@ -94,8 +96,9 @@ class ProxyState:
         available = [a for a in self.accounts if a.is_available()]
         if not available:
             return None
-        
-        account = min(available, key=lambda a: a.request_count)
+
+        # 按优先级降序，再按请求数升序排序
+        account = min(available, key=lambda a: (-a.priority, a.request_count))
         
         if session_id:
             self.session_locks[session_id] = account.id
@@ -108,7 +111,7 @@ class ProxyState:
         available = [a for a in self.accounts if a.is_available() and a.id != exclude_id]
         if not available:
             return None
-        return min(available, key=lambda a: a.request_count)
+        return min(available, key=lambda a: (-a.priority, a.request_count))
     
     def mark_rate_limited(self, account_id: str, duration_seconds: int = 60):
         """标记账号限流"""

@@ -213,6 +213,7 @@ HTML_ACCOUNTS = '''
       <button class="secondary" onclick="createRemoteLogin()">远程登录链接</button>
       <button class="secondary" onclick="scanTokens()">扫描 Token</button>
       <button class="secondary" onclick="showManualAdd()">手动添加</button>
+      <button class="secondary" onclick="showBatchImport()">批量导入</button>
       <button class="secondary" onclick="exportAccounts()">导出账号</button>
       <button class="secondary" onclick="importAccounts()">导入账号</button>
       <button class="secondary" onclick="refreshAllTokens()">刷新 Token</button>
@@ -272,6 +273,25 @@ HTML_ACCOUNTS = '''
     </div>
     <p style="color:var(--muted);font-size:0.75rem;margin-bottom:1rem">Token 可从 ~/.aws/sso/cache/ 目录下的 JSON 文件中获取</p>
     <button onclick="submitManualToken()">添加账号</button>
+  </div>
+  <div class="card" id="batchImportPanel" style="display:none">
+    <h3>批量导入 Token <button class="secondary small" onclick="$('#batchImportPanel').style.display='none'">关闭</button></h3>
+    <div style="margin-bottom:1rem">
+      <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">Token 列表（每行一个 accessToken）</label>
+      <textarea id="batchTokens" placeholder="每行一个 accessToken，支持批量导入，最多 1000 个" style="width:100%;height:200px;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);font-family:monospace;font-size:0.8rem"></textarea>
+    </div>
+    <div style="margin-bottom:1rem">
+      <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">名称前缀（可选）</label>
+      <input type="text" id="batchPrefix" placeholder="批量导入" value="批量导入" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)">
+    </div>
+    <p style="color:var(--muted);font-size:0.75rem;margin-bottom:1rem">将自动命名为：前缀-001, 前缀-002, ...</p>
+    <div style="display:flex;gap:0.5rem;align-items:center">
+      <button onclick="submitBatchImport()">开始导入</button>
+      <span id="batchProgress" style="color:var(--muted);font-size:0.875rem"></span>
+    </div>
+    <div id="batchResult" style="margin-top:1rem;display:none">
+      <pre style="max-height:200px;overflow-y:auto;font-size:0.75rem" id="batchResultLog"></pre>
+    </div>
   </div>
   <div class="card" id="scanResults" style="display:none">
     <h3>扫描结果</h3>
@@ -389,17 +409,37 @@ unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_DISABLE_NONESSENTIAL_T
 HTML_SETTINGS = '''
 <div class="panel" id="settings">
   <div class="card">
+    <h3>代理配置 <button class="secondary small" onclick="loadProxyConfig()">刷新</button></h3>
+    <p style="color:var(--muted);font-size:0.875rem;margin-bottom:1rem">
+      配置全局代理，支持 %s 占位符实现会话固定 IP（每个账号使用固定 IP，降低封号风险）
+    </p>
+
+    <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;cursor:pointer">
+      <input type="checkbox" id="proxyEnabled" onchange="updateProxyConfig()">
+      <span><strong>启用代理</strong></span>
+    </label>
+
+    <div style="margin-bottom:1rem">
+      <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">代理地址</label>
+      <input type="text" id="proxyUrl" placeholder="http://user:pass@proxy.com:7890?session=%s" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);font-family:monospace" onchange="updateProxyConfig()">
+      <p style="color:var(--muted);font-size:0.75rem;margin-top:0.25rem">使用 %s 占位符为每个账号生成唯一会话 ID</p>
+    </div>
+
+    <div id="proxyStats" style="padding:0.75rem;background:var(--bg);border-radius:6px;font-size:0.875rem"></div>
+  </div>
+
+  <div class="card">
     <h3>请求限速 <button class="secondary small" onclick="loadRateLimitConfig()">刷新</button></h3>
     <p style="color:var(--muted);font-size:0.875rem;margin-bottom:1rem">
       启用后会限制请求频率，并在遇到 429 错误时短暂冷却账号
     </p>
-    
+
     <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;cursor:pointer">
       <input type="checkbox" id="rateLimitEnabled" onchange="updateRateLimitConfig()">
       <span><strong>启用限速</strong>（关闭时 429 错误不会导致账号冷却）</span>
     </label>
-    
-    <div id="rateLimitOptions" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1rem">
+
+    <div id="rateLimitOptions" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1rem">
       <div>
         <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">最小请求间隔（秒）</label>
         <input type="number" id="minRequestInterval" value="0.5" min="0" max="10" step="0.1" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)" onchange="updateRateLimitConfig()">
@@ -416,9 +456,34 @@ HTML_SETTINGS = '''
         <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">429 冷却时间（秒）</label>
         <input type="number" id="quotaCooldownSeconds" value="30" min="5" max="300" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)" onchange="updateRateLimitConfig()">
       </div>
+      <div>
+        <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">轮询账号数量（0=不限）</label>
+        <input type="number" id="pollingCount" value="0" min="0" max="100" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)" onchange="updateRateLimitConfig()">
+      </div>
     </div>
-    
+
     <div id="rateLimitStats" style="padding:0.75rem;background:var(--bg);border-radius:6px;font-size:0.875rem"></div>
+  </div>
+
+  <div class="card">
+    <h3>自定义规则 <button class="secondary small" onclick="loadCustomRules()">刷新</button></h3>
+    <p style="color:var(--muted);font-size:0.875rem;margin-bottom:1rem">
+      根据错误响应关键字自动限速或禁用账号（借鉴 Tokens 平台）
+    </p>
+
+    <div style="margin-bottom:1rem">
+      <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">规则列表（每行一条）</label>
+      <textarea id="customRulesText" placeholder="关键字|LIMIT|时间 或 关键字|DEACTIVE" style="width:100%;height:150px;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);font-family:monospace;font-size:0.8rem"></textarea>
+      <p style="color:var(--muted);font-size:0.75rem;margin-top:0.25rem">
+        格式：<code>关键字|LIMIT|时间</code>（限速）或 <code>关键字|DEACTIVE</code>（禁用）<br>
+        时间格式：30s, 5m, 1h, 1d
+      </p>
+    </div>
+
+    <div style="display:flex;gap:0.5rem;align-items:center">
+      <button onclick="updateCustomRules()">保存规则</button>
+      <span id="rulesStats" style="color:var(--muted);font-size:0.875rem"></span>
+    </div>
   </div>
 
   <div class="card">
@@ -426,7 +491,7 @@ HTML_SETTINGS = '''
     <p style="color:var(--muted);font-size:0.875rem;margin-bottom:1rem">
       处理 Kiro API 的输入长度限制（CONTENT_LENGTH_EXCEEDS_THRESHOLD 错误）
     </p>
-    
+
     <div style="margin-bottom:1rem">
       <p style="font-weight:500;margin-bottom:0.5rem">启用的策略（可多选）：</p>
       <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem;cursor:pointer">
@@ -446,8 +511,8 @@ HTML_SETTINGS = '''
         <span><strong>预估检测</strong> - 发送前预估 token 数量</span>
       </label>
     </div>
-    
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1rem">
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1rem">
       <div>
         <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">最大消息数</label>
         <input type="number" id="maxMessages" value="30" min="5" max="100" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)" onchange="updateHistoryConfig()">
@@ -465,10 +530,10 @@ HTML_SETTINGS = '''
         <input type="number" id="maxRetries" value="2" min="1" max="5" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)" onchange="updateHistoryConfig()">
       </div>
     </div>
-    
+
     <div id="summaryOptions" style="display:none;margin-bottom:1rem;padding:1rem;background:var(--bg);border-radius:6px">
       <p style="font-weight:500;margin-bottom:0.5rem">智能摘要选项：</p>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem">
         <div>
           <label style="display:block;font-size:0.875rem;color:var(--muted);margin-bottom:0.25rem">保留最近消息数</label>
           <input type="number" id="summaryKeepRecent" value="10" min="3" max="30" style="width:100%;padding:0.5rem;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text)" onchange="updateHistoryConfig()">
@@ -498,23 +563,11 @@ HTML_SETTINGS = '''
         </div>
       </div>
     </div>
-    
+
     <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer">
       <input type="checkbox" id="addWarningHeader" onchange="updateHistoryConfig()">
       <span>截断时添加警告信息</span>
     </label>
-    
-    <div style="margin-top:1rem;padding:1rem;background:var(--bg);border-radius:6px">
-      <p style="font-size:0.875rem;color:var(--muted)">
-        <strong>策略说明：</strong><br>
-        • <strong>自动截断</strong>：每次请求前优先保留最新上下文并摘要前文，必要时按数量/字符截断<br>
-        • <strong>智能摘要</strong>：用 AI 生成早期对话摘要，保留关键信息（需额外 API 调用，增加延迟）<br>
-        • <strong>错误重试</strong>：收到长度超限错误后，截断历史消息并自动重试<br>
-        • <strong>预估检测</strong>：发送前估算 token 数量，超过阈值则预先截断<br>
-        <br>
-        推荐组合：<strong>错误重试</strong>（默认）或 <strong>智能摘要 + 错误重试</strong>
-      </p>
-    </div>
   </div>
 </div>
 '''
@@ -774,12 +827,14 @@ async function loadAccounts(){
       const statusText={active:'可用',cooldown:'冷却中',unhealthy:'不健康',disabled:'已禁用',suspended:'已封禁'}[a.status]||a.status;
       const authBadge=a.auth_method==='idc'?'info':'success';
       const authText=a.auth_method==='idc'?'IdC':'Social';
+      const priorityBadge=a.priority>0?`<span class="badge info">P${a.priority}</span>`:'';
       return `
         <div class="account-card">
           <div class="account-header">
             <div class="account-name">
               <span class="badge ${statusBadge}">${statusText}</span>
               <span class="badge ${authBadge}">${authText}</span>
+              ${priorityBadge}
               <span>${a.name}</span>
             </div>
             <span style="color:var(--muted);font-size:0.75rem">${a.id}</span>
@@ -787,12 +842,14 @@ async function loadAccounts(){
           <div class="account-meta">
             <div class="account-meta-item"><span>请求数</span><span>${a.request_count}</span></div>
             <div class="account-meta-item"><span>错误数</span><span>${a.error_count}</span></div>
+            <div class="account-meta-item"><span>优先级</span><span>${a.priority||0}</span></div>
             <div class="account-meta-item"><span>Token</span><span class="badge ${a.token_expired?'error':a.token_expiring_soon?'warn':'success'}">${a.token_expired?'已过期':a.token_expiring_soon?'即将过期':'有效'}</span></div>
             ${a.cooldown_remaining?`<div class="account-meta-item"><span>冷却剩余</span><span>${a.cooldown_remaining}秒</span></div>`:''}
           </div>
           <div id="usage-${a.id}" class="account-usage" style="display:none;margin-top:0.75rem;padding:0.75rem;background:var(--bg);border-radius:6px"></div>
           <div class="account-actions">
             <button class="secondary small" onclick="queryUsage('${a.id}')">查询用量</button>
+            <button class="secondary small" onclick="setPriority('${a.id}',${a.priority||0})">设置优先级</button>
             <button class="secondary small" onclick="refreshToken('${a.id}')">刷新 Token</button>
             <button class="secondary small" onclick="viewAccountDetail('${a.id}')">详情</button>
             ${a.status==='cooldown'?`<button class="secondary small" onclick="restoreAccount('${a.id}')">恢复</button>`:''}
@@ -803,6 +860,16 @@ async function loadAccounts(){
       `;
     }).join('');
   }catch(e){console.error(e)}
+}
+
+async function setPriority(id,current){
+  const priority=prompt('设置优先级（数字越大优先级越高，0=默认）:',current);
+  if(priority===null)return;
+  const p=parseInt(priority)||0;
+  try{
+    await fetch('/api/accounts/'+id+'/priority',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority:p})});
+    loadAccounts();
+  }catch(e){alert('设置失败: '+e.message)}
 }
 
 async function queryUsage(id){
@@ -1023,6 +1090,66 @@ async function submitManualToken(){
       alert(d.detail||'添加失败');
     }
   }catch(e){alert('添加失败: '+e.message)}
+}
+
+// 批量导入 Token
+function showBatchImport(){
+  $('#batchImportPanel').style.display='block';
+  $('#batchTokens').value='';
+  $('#batchProgress').textContent='';
+  $('#batchResult').style.display='none';
+  $('#batchResultLog').textContent='';
+}
+
+async function submitBatchImport(){
+  const tokensText=$('#batchTokens').value.trim();
+  const prefix=$('#batchPrefix').value||'批量导入';
+  if(!tokensText){alert('请输入 Token 列表');return;}
+
+  const tokens=tokensText.split('\\n').map(t=>t.trim()).filter(t=>t&&t.length>50);
+  if(tokens.length===0){alert('没有有效的 Token');return;}
+  if(tokens.length>1000){alert('最多支持 1000 个 Token');return;}
+
+  const progress=$('#batchProgress');
+  const resultDiv=$('#batchResult');
+  const resultLog=$('#batchResultLog');
+
+  resultDiv.style.display='block';
+  resultLog.textContent='';
+
+  let success=0,failed=0;
+
+  for(let i=0;i<tokens.length;i++){
+    const token=tokens[i];
+    const name=`${prefix}-${String(i+1).padStart(3,'0')}`;
+    progress.textContent=`导入中: ${i+1}/${tokens.length}`;
+
+    try{
+      const r=await fetch('/api/accounts/manual',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name,access_token:token})
+      });
+      const d=await r.json();
+      if(d.ok){
+        resultLog.textContent+=`✅ ${name} 导入成功\\n`;
+        success++;
+      }else{
+        resultLog.textContent+=`❌ ${name} 失败: ${d.detail||'未知错误'}\\n`;
+        failed++;
+      }
+    }catch(e){
+      resultLog.textContent+=`❌ ${name} 异常: ${e.message}\\n`;
+      failed++;
+    }
+    resultLog.scrollTop=resultLog.scrollHeight;
+
+    // 每10个暂停一下
+    if((i+1)%10===0)await new Promise(r=>setTimeout(r,100));
+  }
+
+  progress.textContent=`完成: 成功 ${success}, 失败 ${failed}`;
+  loadAccounts();
 }
 
 // 导出账号
@@ -1319,6 +1446,56 @@ async function exportFlows(){
 JS_SETTINGS = '''
 // 设置页面
 
+// 代理配置
+async function loadProxyConfig(){
+  try{
+    const r=await fetch('/api/settings/proxy');
+    const d=await r.json();
+    $('#proxyEnabled').checked=d.enabled;
+    $('#proxyUrl').value=d.proxy_url||'';
+    $('#proxyStats').innerHTML=`
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:0.5rem">
+        <span>状态: <span class="badge ${d.enabled?'success':'warn'}">${d.enabled?'已启用':'已禁用'}</span></span>
+        <span>会话占位符: <span class="badge ${d.has_session_placeholder?'success':'info'}">${d.has_session_placeholder?'已配置':'未配置'}</span></span>
+        <span>缓存会话: ${d.cached_sessions||0}</span>
+      </div>
+    `;
+  }catch(e){console.error('加载代理配置失败:',e)}
+}
+
+async function updateProxyConfig(){
+  const config={
+    enabled:$('#proxyEnabled').checked,
+    proxy_url:$('#proxyUrl').value.trim()
+  };
+  try{
+    await fetch('/api/settings/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});
+    loadProxyConfig();
+  }catch(e){console.error('保存代理配置失败:',e)}
+}
+
+// 自定义规则
+async function loadCustomRules(){
+  try{
+    const r=await fetch('/api/settings/rules');
+    const d=await r.json();
+    $('#customRulesText').value=d.rules_text||'';
+    $('#rulesStats').textContent=`共 ${d.total_rules||0} 条规则（限速: ${d.limit_rules||0}, 禁用: ${d.deactive_rules||0}）`;
+  }catch(e){console.error('加载规则失败:',e)}
+}
+
+async function updateCustomRules(){
+  const rules_text=$('#customRulesText').value;
+  try{
+    const r=await fetch('/api/settings/rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rules_text})});
+    const d=await r.json();
+    if(d.ok){
+      $('#rulesStats').textContent=`已保存 ${d.total_rules||0} 条规则`;
+      loadCustomRules();
+    }
+  }catch(e){console.error('保存规则失败:',e)}
+}
+
 // 策略警告信息
 const strategyWarnings = {
   error_retry: {
@@ -1377,7 +1554,6 @@ function onStrategyChange(strategy, checked) {
     const warning = strategyWarnings[strategy];
     const confirmed = confirm(warning.title + '\\n\\n' + warning.message.replace(/<[^>]+>/g, ''));
     if (!confirmed) {
-      // 用户取消，恢复勾选
       if (strategy === 'error_retry') $('#strategyErrorRetry').checked = true;
       else if (strategy === 'auto_truncate') $('#strategyAutoTruncate').checked = true;
       else if (strategy === 'smart_summary') $('#strategySmartSummary').checked = true;
@@ -1385,7 +1561,6 @@ function onStrategyChange(strategy, checked) {
       return;
     }
   }
-  // 显示/隐藏摘要选项
   $('#summaryOptions').style.display = $('#strategySmartSummary').checked ? 'block' : 'none';
   updateHistoryConfig();
 }
@@ -1394,7 +1569,6 @@ async function loadHistoryConfig(){
   try{
     const r=await fetch('/api/settings/history');
     const d=await r.json();
-    // 默认启用错误重试
     const strategies = d.strategies || ['error_retry'];
     $('#strategyAutoTruncate').checked=strategies.includes('auto_truncate');
     $('#strategySmartSummary').checked=strategies.includes('smart_summary');
@@ -1411,7 +1585,6 @@ async function loadHistoryConfig(){
     $('#summaryCacheDeltaChars').value=d.summary_cache_min_delta_chars||4000;
     $('#summaryCacheMaxAge').value=d.summary_cache_max_age_seconds||180;
     $('#addWarningHeader').checked=d.add_warning_header!==false;
-    // 显示/隐藏摘要选项
     $('#summaryOptions').style.display=$('#strategySmartSummary').checked?'block':'none';
   }catch(e){console.error('加载配置失败:',e)}
 }
@@ -1423,7 +1596,6 @@ async function updateHistoryConfig(){
   if($('#strategyErrorRetry').checked)strategies.push('error_retry');
   if($('#strategyPreEstimate').checked)strategies.push('pre_estimate');
   if(strategies.length===0)strategies.push('none');
-  // 显示/隐藏摘要选项
   $('#summaryOptions').style.display=$('#strategySmartSummary').checked?'block':'none';
   const config={
     strategies,
@@ -1454,13 +1626,14 @@ async function loadRateLimitConfig(){
     $('#maxRequestsPerMinute').value=d.max_requests_per_minute||60;
     $('#globalMaxRequestsPerMinute').value=d.global_max_requests_per_minute||120;
     $('#quotaCooldownSeconds').value=d.quota_cooldown_seconds||30;
-    // 更新统计
+    $('#pollingCount').value=d.polling_count||0;
     const stats=d.stats||{};
     $('#rateLimitStats').innerHTML=`
       <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:0.5rem">
         <span>状态: <span class="badge ${d.enabled?'success':'warn'}">${d.enabled?'已启用':'已禁用'}</span></span>
         <span>全局 RPM: ${stats.global_rpm||0}</span>
         <span>429 冷却: ${d.enabled?(d.quota_cooldown_seconds||30)+'秒':'禁用'}</span>
+        <span>轮询数: ${d.polling_count||'不限'}</span>
       </div>
     `;
   }catch(e){console.error('加载限速配置失败:',e)}
@@ -1472,7 +1645,8 @@ async function updateRateLimitConfig(){
     min_request_interval:parseFloat($('#minRequestInterval').value)||0.5,
     max_requests_per_minute:parseInt($('#maxRequestsPerMinute').value)||60,
     global_max_requests_per_minute:parseInt($('#globalMaxRequestsPerMinute').value)||120,
-    quota_cooldown_seconds:parseInt($('#quotaCooldownSeconds').value)||30
+    quota_cooldown_seconds:parseInt($('#quotaCooldownSeconds').value)||30,
+    polling_count:parseInt($('#pollingCount').value)||0
   };
   try{
     await fetch('/api/settings/rate-limit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});
@@ -1481,6 +1655,8 @@ async function updateRateLimitConfig(){
 }
 
 // 页面加载时加载设置
+loadProxyConfig();
+loadCustomRules();
 loadHistoryConfig();
 loadRateLimitConfig();
 '''
@@ -1503,7 +1679,7 @@ HTML_PAGE = f'''<!DOCTYPE html>
 <body>
 <div class="container">
 {HTML_BODY}
-<div class="footer">Kiro API Proxy v1.7.0 - Codex 工具调用 | 环境变量配置 | 限速开关修复</div>
+<div class="footer">Kiro API Proxy v1.8.0 - 代理会话固定 | 自定义规则 | 账号优先级</div>
 </div>
 <script>
 {JS_SCRIPTS}

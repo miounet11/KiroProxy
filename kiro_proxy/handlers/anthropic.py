@@ -13,6 +13,7 @@ from ..core.state import RequestLog
 from ..core.history_manager import HistoryManager, get_history_config, is_content_length_error, TruncateStrategy
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
+from ..core.custom_rules import get_rule_manager, RuleAction
 from ..credential import quota_manager
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream_full, parse_event_stream, is_quota_exceeded_error
 from ..converters import (
@@ -58,17 +59,33 @@ def _count_tokens_from_messages(messages, system: str = "") -> int:
 def _handle_kiro_error(status_code: int, error_text: str, account):
     """处理 Kiro API 错误，返回 (http_status, error_type, error_message)"""
     error = classify_error(status_code, error_text)
-    
+
     # 打印友好的错误日志
     print(format_error_log(error, account.id if account else None))
-    
+
+    # 先检查自定义规则
+    rule_manager = get_rule_manager()
+    rule_result = rule_manager.match(error_text)
+    if rule_result.matched and account:
+        if rule_result.action == RuleAction.DEACTIVE:
+            account.enabled = False
+            from ..credential import CredentialStatus
+            account.status = CredentialStatus.SUSPENDED
+            print(f"[CustomRule] 账号 {account.id} 已被禁用 (匹配规则: {rule_result.rule.keyword})")
+        elif rule_result.action == RuleAction.LIMIT:
+            from ..credential import quota_manager as qm
+            qm.mark_exceeded(account.id, f"Rule: {rule_result.rule.keyword}", rule_result.duration_seconds)
+            from ..credential import CredentialStatus
+            account.status = CredentialStatus.COOLDOWN
+            print(f"[CustomRule] 账号 {account.id} 限速 {rule_result.duration_seconds}s (匹配规则: {rule_result.rule.keyword})")
+
     # 账号封禁 - 禁用账号
-    if error.should_disable_account and account:
+    elif error.should_disable_account and account:
         account.enabled = False
         from ..credential import CredentialStatus
         account.status = CredentialStatus.SUSPENDED
         print(f"[Account] 账号 {account.id} 已被禁用 (封禁)")
-    
+
     # 配额超限 - 标记冷却
     elif error.type == ErrorType.RATE_LIMITED and account:
         account.mark_quota_exceeded(error.message[:100])

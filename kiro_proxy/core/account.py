@@ -22,6 +22,7 @@ class Account:
     error_count: int = 0
     last_used: Optional[float] = None
     status: CredentialStatus = CredentialStatus.ACTIVE
+    priority: int = 0  # 优先级，数值越大优先级越高
     
     _credentials: Optional[KiroCredentials] = field(default=None, repr=False)
     _machine_id: Optional[str] = field(default=None, repr=False)
@@ -146,7 +147,7 @@ class Account:
         """获取状态信息"""
         cooldown_remaining = quota_manager.get_cooldown_remaining(self.id)
         creds = self.get_credentials()
-        
+
         return {
             "id": self.id,
             "name": self.name,
@@ -156,6 +157,7 @@ class Account:
             "request_count": self.request_count,
             "error_count": self.error_count,
             "cooldown_remaining": cooldown_remaining,
+            "priority": self.priority,
             "token_expired": self.is_token_expired() if creds else None,
             "token_expiring_soon": self.is_token_expiring_soon() if creds else None,
             "auth_method": creds.auth_method if creds else None,
